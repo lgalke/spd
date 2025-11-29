@@ -81,6 +81,7 @@ class CIOutputs:
     lower_leaky: dict[str, Float[Tensor, "... C"]]
     upper_leaky: dict[str, Float[Tensor, "... C"]]
     pre_sigmoid: dict[str, Tensor]
+    group_importances: Float[Tensor, "batch num_groups"] | None = None  # Only for hierarchical mode
 
 
 class ComponentModel(LoadableModule):
@@ -110,6 +111,12 @@ class ComponentModel(LoadableModule):
         ci_fn_hidden_dims: list[int],
         sigmoid_type: SigmoidType,
         pretrained_model_output_attr: str | None,
+        # Hierarchical SPD parameters
+        num_groups: int | None = None,
+        router_hidden_dim: int = 64,
+        within_group_hidden_dim: int = 16,
+        router_aggregation: Literal["per_layer_mean", "global_mean", "per_layer_max"] = "per_layer_mean",
+        group_init_strategy: Literal["random", "layer_based", "kmeans"] = "random",
     ):
         super().__init__()
 
@@ -121,6 +128,7 @@ class ComponentModel(LoadableModule):
 
         self.target_model = target_model
         self.C = C
+        self.ci_fn_type = ci_fn_type
         self.pretrained_model_output_attr = pretrained_model_output_attr
         self.target_module_paths = get_target_module_paths(target_model, target_module_patterns)
 
@@ -133,16 +141,47 @@ class ComponentModel(LoadableModule):
             {k.replace(".", "-"): self.components[k] for k in sorted(self.components)}
         )
 
-        self.ci_fns = ComponentModel._create_ci_fns(
-            target_model=target_model,
-            target_module_paths=self.target_module_paths,
-            C=C,
-            ci_fn_type=ci_fn_type,
-            ci_fn_hidden_dims=ci_fn_hidden_dims,
-        )
-        self._ci_fns = nn.ModuleDict(
-            {k.replace(".", "-"): self.ci_fns[k] for k in sorted(self.ci_fns)}
-        )
+        # Create CI functions (either per-module or hierarchical)
+        if ci_fn_type == "hierarchical":
+            # Import here to avoid circular dependency
+            from spd.hierarchical import GroupAssignment, HierarchicalImportanceFunction
+
+            assert num_groups is not None, "num_groups must be set for hierarchical CI function"
+
+            # Create group assignment
+            layer_num_subcomponents = [C] * len(self.target_module_paths)
+            self.group_assignment = GroupAssignment(
+                num_groups=num_groups,
+                layer_num_subcomponents=layer_num_subcomponents,
+                init_strategy=group_init_strategy,
+            )
+
+            # Create hierarchical importance function
+            self.hierarchical_ci_fn = HierarchicalImportanceFunction(
+                group_assignment=self.group_assignment,
+                router_hidden_dim=router_hidden_dim,
+                within_group_hidden_dim=within_group_hidden_dim,
+                router_aggregation=router_aggregation,
+            )
+
+            # For compatibility, create empty ci_fns dict
+            self.ci_fns: dict[str, nn.Module] = {}
+            self._ci_fns = nn.ModuleDict()
+        else:
+            # Standard per-module CI functions
+            self.group_assignment = None
+            self.hierarchical_ci_fn = None
+
+            self.ci_fns = ComponentModel._create_ci_fns(
+                target_model=target_model,
+                target_module_paths=self.target_module_paths,
+                C=C,
+                ci_fn_type=ci_fn_type,
+                ci_fn_hidden_dims=ci_fn_hidden_dims,
+            )
+            self._ci_fns = nn.ModuleDict(
+                {k.replace(".", "-"): self.ci_fns[k] for k in sorted(self.ci_fns)}
+            )
 
         if sigmoid_type == "leaky_hard":
             self.lower_leaky_fn = SIGMOID_TYPES["lower_leaky_hard"]
@@ -514,6 +553,12 @@ class ComponentModel(LoadableModule):
             ci_fn_type=config.ci_fn_type,
             pretrained_model_output_attr=config.pretrained_model_output_attr,
             sigmoid_type=config.sigmoid_type,
+            # Hierarchical parameters
+            num_groups=config.num_groups,
+            router_hidden_dim=config.router_hidden_dim,
+            within_group_hidden_dim=config.within_group_hidden_dim,
+            router_aggregation=config.router_aggregation,
+            group_init_strategy=config.group_init_strategy,
         )
 
         comp_model_weights = torch.load(
@@ -547,6 +592,11 @@ class ComponentModel(LoadableModule):
         Returns:
             Tuple of (causal_importances, causal_importances_upper_leaky) dictionaries for each layer.
         """
+        if self.ci_fn_type == "hierarchical":
+            return self._calc_hierarchical_causal_importances(
+                pre_weight_acts, sampling, detach_inputs
+            )
+
         causal_importances_lower_leaky = {}
         causal_importances_upper_leaky = {}
         pre_sigmoid = {}
@@ -591,6 +641,68 @@ class ComponentModel(LoadableModule):
             lower_leaky=causal_importances_lower_leaky,
             upper_leaky=causal_importances_upper_leaky,
             pre_sigmoid=pre_sigmoid,
+        )
+
+    def _calc_hierarchical_causal_importances(
+        self,
+        pre_weight_acts: dict[str, Float[Tensor, "... d_in"] | Int[Tensor, "... pos"]],
+        sampling: SamplingType,
+        detach_inputs: bool = False,
+    ) -> CIOutputs:
+        """Calculate causal importances using hierarchical importance function.
+
+        Args:
+            pre_weight_acts: The activations before each layer in the target model.
+            sampling: Sampling type
+            detach_inputs: Whether to detach inputs
+
+        Returns:
+            CIOutputs with importance values organized by module name
+        """
+        assert self.hierarchical_ci_fn is not None
+
+        # Compute inner activations for all modules
+        inner_acts_by_layer: dict[int, Float[Tensor, "batch C"]] = {}
+        for layer_idx, target_module_name in enumerate(self.target_module_paths):
+            input_activations = pre_weight_acts[target_module_name]
+            inner_acts = self.components[target_module_name].get_inner_acts(input_activations)
+
+            if detach_inputs:
+                inner_acts = inner_acts.detach()
+
+            inner_acts_by_layer[layer_idx] = inner_acts
+
+        # Get importance values from hierarchical function
+        importance_by_layer, group_importances = self.hierarchical_ci_fn(inner_acts_by_layer)
+
+        # Convert to module-name-keyed dicts and apply sampling/sigmoid
+        causal_importances_lower_leaky = {}
+        causal_importances_upper_leaky = {}
+        pre_sigmoid_dict = {}
+
+        for layer_idx, target_module_name in enumerate(self.target_module_paths):
+            # Importance values are already post-sigmoid from hierarchical function
+            importance = importance_by_layer[layer_idx]
+
+            if sampling == "binomial":
+                importance_for_lower = 1.05 * importance - 0.05 * torch.rand_like(importance)
+            else:
+                importance_for_lower = importance
+
+            # Hierarchical function already applies sigmoid, but we need to ensure bounds
+            causal_importances_lower_leaky[target_module_name] = importance_for_lower.clamp(
+                min=0, max=1
+            )
+            causal_importances_upper_leaky[target_module_name] = importance.clamp(min=0)
+
+            # Store the importance values as pre_sigmoid (even though they're post-sigmoid in hierarchical case)
+            pre_sigmoid_dict[target_module_name] = importance
+
+        return CIOutputs(
+            lower_leaky=causal_importances_lower_leaky,
+            upper_leaky=causal_importances_upper_leaky,
+            pre_sigmoid=pre_sigmoid_dict,
+            group_importances=group_importances,
         )
 
     def calc_weight_deltas(self) -> dict[str, Float[Tensor, " d_out d_in"]]:

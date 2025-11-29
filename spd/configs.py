@@ -43,6 +43,11 @@ class ImportanceMinimalityLossConfig(LossMetricConfig):
     eps: float = 1e-12
 
 
+class GroupSparsityLossConfig(LossMetricConfig):
+    classname: Literal["GroupSparsityLoss"] = "GroupSparsityLoss"
+    pnorm: float = 1.0
+
+
 class UniformKSubsetRoutingConfig(BaseConfig):
     type: Literal["uniform_k_subset"] = "uniform_k_subset"
 
@@ -206,7 +211,12 @@ ReconLossConfigType = (
     | StochasticHiddenActsReconLossConfig
 )
 
-LossMetricConfigType = FaithfulnessLossConfig | ImportanceMinimalityLossConfig | ReconLossConfigType
+LossMetricConfigType = (
+    FaithfulnessLossConfig
+    | ImportanceMinimalityLossConfig
+    | GroupSparsityLossConfig
+    | ReconLossConfigType
+)
 
 EvalOnlyMetricConfigType = (
     CEandKLLossesConfig
@@ -261,6 +271,37 @@ class Config(BaseConfig):
         default=[8],
         description="Hidden dimensions for the causal importance function used to calculate the causal importance",
     )
+
+    # --- Hierarchical SPD parameters (only used if ci_fn_type == "hierarchical") ---
+    num_groups: PositiveInt | None = Field(
+        default=None,
+        description="Number of groups for hierarchical SPD. Required if ci_fn_type is 'hierarchical'.",
+    )
+    router_hidden_dim: PositiveInt = Field(
+        default=64,
+        description="Hidden dimension for group router MLP in hierarchical SPD",
+    )
+    within_group_hidden_dim: PositiveInt = Field(
+        default=16,
+        description="Hidden dimension for within-group importance MLPs in hierarchical SPD",
+    )
+    router_aggregation: Literal["per_layer_mean", "global_mean", "per_layer_max"] = Field(
+        default="per_layer_mean",
+        description="How router aggregates inner activations in hierarchical SPD",
+    )
+    group_init_strategy: Literal["random", "layer_based", "kmeans"] = Field(
+        default="random",
+        description="Initialization strategy for group assignments in hierarchical SPD",
+    )
+    group_sparsity_coeff: NonNegativeFloat = Field(
+        default=0.0,
+        description="Coefficient for group sparsity loss in hierarchical SPD (L1 on group importances)",
+    )
+    group_sparsity_pnorm: float = Field(
+        default=1.0,
+        description="p-norm for group sparsity loss in hierarchical SPD",
+    )
+
     sampling: SamplingType = Field(
         default="continuous",
         description="Sampling mode for stochastic elements: 'continuous' (default) or 'binomial'",
@@ -511,6 +552,12 @@ class Config(BaseConfig):
         if self.lr_schedule == "exponential":
             assert self.lr_exponential_halflife is not None, (
                 "lr_exponential_halflife must be set if lr_schedule is exponential"
+            )
+
+        # Check hierarchical SPD parameters
+        if self.ci_fn_type == "hierarchical":
+            assert self.num_groups is not None, (
+                "num_groups must be set if ci_fn_type is 'hierarchical'"
             )
 
         assert self.batch_size % self.gradient_accumulation_steps == 0, (

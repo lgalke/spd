@@ -153,6 +153,12 @@ def optimize(
         ci_fn_hidden_dims=config.ci_fn_hidden_dims,
         pretrained_model_output_attr=config.pretrained_model_output_attr,
         sigmoid_type=config.sigmoid_type,
+        # Hierarchical parameters
+        num_groups=config.num_groups,
+        router_hidden_dim=config.router_hidden_dim,
+        within_group_hidden_dim=config.within_group_hidden_dim,
+        router_aggregation=config.router_aggregation,
+        group_init_strategy=config.group_init_strategy,
     )
 
     if ln_stds is not None:

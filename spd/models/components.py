@@ -9,7 +9,7 @@ from torch import Tensor, nn
 
 from spd.utils.module_utils import _NonlinearityType, init_param_
 
-CiFnType = Literal["mlp", "vector_mlp", "shared_mlp"]
+CiFnType = Literal["mlp", "vector_mlp", "shared_mlp", "hierarchical"]
 
 
 class ParallelLinear(nn.Module):

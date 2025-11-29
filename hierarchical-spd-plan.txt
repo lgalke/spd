@@ -1,0 +1,1337 @@
+================================================================================
+HIERARCHICAL STOCHASTIC PARAMETER DECOMPOSITION (H-SPD)
+Implementation Plan for Scalable Compositional Decomposition
+================================================================================
+
+DOCUMENT VERSION: 1.0
+DATE: 2025-01-29
+PURPOSE: Self-contained implementation guide for Claude Code integration into
+         the SPD codebase at https://github.com/goodfire-ai/spd/tree/spd-paper
+
+================================================================================
+SECTION 1: MOTIVATION AND OVERVIEW
+================================================================================
+
+1.1 PROBLEM STATEMENT
+---------------------
+The current SPD implementation has scalability bottlenecks:
+
+(a) Per-subcomponent MLPs: Each of C×L subcomponents has its own causal 
+    importance MLP (Γ^l_c), creating O(C×L×d_gate) parameters just for gating.
+    For a model with 100 layers and 1000 subcomponents per layer, this means
+    100,000 independent small networks.
+
+(b) No cross-layer structure: The paper observes that subcomponents naturally
+    cluster (e.g., W_out matrices decompose into subcomponents that "all 
+    coactivate for all input features"), but this structure is discovered 
+    post-hoc rather than exploited during training.
+
+(c) Independent importance computation: Computing importance for all 
+    subcomponents scales as O(C×L) even when most are inactive.
+
+1.2 PROPOSED SOLUTION: HIERARCHICAL COMPONENT GROUPS
+----------------------------------------------------
+Introduce a two-level hierarchy:
+
+Level 1 - GROUPS: Collections of subcomponents that tend to co-activate.
+          Groups can span multiple layers, capturing cross-layer mechanisms.
+          A lightweight router predicts which groups are relevant for an input.
+
+Level 2 - SUBCOMPONENTS: Fine-grained rank-one matrices within each group.
+          Importance is computed only for subcomponents in active groups.
+
+Key insight: This mirrors how the paper already observes structure:
+- In TMS+ID (Section 3.2): 5 feature subcomponents + 2 identity subcomponents
+- In Compressed Computation (Section 3.3): 100 Win subcomponents that activate
+  individually + 50 Wout subcomponents that always co-activate as one group
+- The Wout subcomponents forming a "single rank-50 identity component" is 
+  exactly the kind of group structure we want to learn automatically.
+
+1.3 EXPECTED BENEFITS
+---------------------
+- Parameter reduction: Shared router + per-group networks instead of C×L MLPs
+- Compute reduction: Only compute fine-grained importance for active groups
+- Interpretability: Groups correspond to mechanisms (cross-layer circuits)
+- Better optimization: Hierarchical structure provides useful inductive bias
+
+
+================================================================================
+SECTION 2: MATHEMATICAL FORMULATION
+================================================================================
+
+2.1 NOTATION
+------------
+L       = number of layers in target model
+C^l     = number of subcomponents in layer l
+G       = number of groups (hyperparameter, typically G << sum_l C^l)
+K_g     = set of (layer, subcomponent) indices belonging to group g
+U^l_c   = left factor of subcomponent c in layer l (shape: d_out × 1)
+V^l_c   = right factor of subcomponent c in layer l (shape: 1 × d_in)
+a^l(x)  = pre-weight activation at layer l for input x
+h^l_c(x)= inner activation = V^l_c @ a^l(x)  (scalar)
+
+2.2 GROUP ASSIGNMENT
+--------------------
+Each subcomponent (l, c) belongs to exactly one group g. We denote:
+
+    k(l, c) -> g    (mapping from subcomponent to group)
+
+This can be:
+(a) Fixed/learned discrete assignment (simpler, used in initial implementation)
+(b) Soft probabilistic assignment (more flexible, future extension)
+
+For initial implementation, use LEARNABLE DISCRETE ASSIGNMENT:
+- Initialize group assignments randomly or via clustering
+- Periodically reassign based on co-activation patterns (see Section 4.5)
+
+2.3 TWO-LEVEL IMPORTANCE COMPUTATION
+------------------------------------
+The causal importance of subcomponent (l, c) factorizes as:
+
+    g^l_c(x) = g_group(k(l,c), x) × g_within(l, c, x | group k(l,c))
+
+where:
+
+(a) GROUP IMPORTANCE: g_group(g, x) ∈ [0, 1]
+    - Single network shared across all groups
+    - Input: aggregated representation of the input
+    - Output: G-dimensional vector of group importances
+
+(b) WITHIN-GROUP IMPORTANCE: g_within(l, c, x | g) ∈ [0, 1]
+    - One small network PER GROUP (not per subcomponent!)
+    - Input: inner activations of subcomponents in that group
+    - Output: importance values for subcomponents in group g
+    - Only computed if g_group(g, x) > threshold (for efficiency)
+
+2.4 GROUP IMPORTANCE NETWORK (ROUTER)
+-------------------------------------
+Architecture for g_group:
+
+    Input representation r(x):
+        Option A: Mean of all inner activations (simple)
+                  r(x) = (1/sum_l C^l) * sum_{l,c} h^l_c(x)
+        
+        Option B: Per-layer summary concatenated (richer)
+                  r^l(x) = mean_c h^l_c(x)  or  max_c |h^l_c(x)|
+                  r(x) = concat([r^1(x), ..., r^L(x)])
+        
+        Option C: Learnable aggregation (most flexible)
+                  r(x) = MLP(concat of sampled/top-k inner activations)
+
+    Router network:
+        g_group(x) = σ_H(W_2 · GELU(W_1 · r(x) + b_1) + b_2)
+        
+        where σ_H is hard sigmoid, output shape is (G,)
+
+    Parameters: W_1 ∈ R^{d_router × d_input}, W_2 ∈ R^{G × d_router}
+                Typical: d_router = 64-256, much smaller than C×L×d_gate
+
+2.5 WITHIN-GROUP IMPORTANCE NETWORK
+-----------------------------------
+For each group g with |K_g| subcomponents:
+
+    Input: h_g(x) = stack([h^l_c(x) for (l,c) in K_g])  # shape: (|K_g|,)
+    
+    Network: g_within(x | g) = σ_H(MLP_g(h_g(x)))       # shape: (|K_g|,)
+
+    The MLP_g is small since |K_g| << total subcomponents.
+    
+    Architecture per group:
+        MLP_g: Linear(|K_g|, d_gate) -> GELU -> Linear(d_gate, |K_g|)
+
+2.6 COMBINED IMPORTANCE (FULL FORMULA)
+--------------------------------------
+For subcomponent (l, c) in group g = k(l, c):
+
+    g^l_c(x) = g_group(g, x) × g_within(l, c, x | g)
+
+This factorization means:
+- If a group is unimportant (g_group ≈ 0), all its subcomponents are masked
+- Within an important group, fine-grained selection still occurs
+
+2.7 LOSS FUNCTIONS
+------------------
+The total loss extends SPD's loss with group-level regularization:
+
+    L_HSPD = L_faithfulness 
+           + β_1 × L_stochastic-recon 
+           + β_2 × L_stochastic-recon-layerwise
+           + β_3 × L_importance-minimality      # subcomponent level
+           + β_4 × L_group-sparsity             # NEW: group level
+           + β_5 × L_group-balance              # NEW: prevent degenerate groups
+
+Where:
+
+(a) L_importance-minimality (modified to use factorized importance):
+    
+    L_importance-minimality = sum_{l,c} |g^l_c(x)|^p
+                            = sum_{l,c} |g_group(k(l,c), x) × g_within(l,c,x)|^p
+
+(b) L_group-sparsity (encourages few groups to be active):
+
+    L_group-sparsity = sum_{g=1}^{G} |g_group(g, x)|^q
+    
+    where q ∈ (0, 2], typically q = 1 for L1 sparsity
+
+(c) L_group-balance (prevents empty or oversized groups):
+
+    L_group-balance = -H(assignment distribution) + λ × max_g |K_g| / mean_g |K_g|
+    
+    Simpler alternative: soft constraint that group sizes stay within [min, max]
+
+2.8 MASK SAMPLING (MODIFIED)
+----------------------------
+The stochastic masking from original SPD is modified:
+
+    Original: m^l_c(x, r) = g^l_c(x) + (1 - g^l_c(x)) × r^l_c,  r ~ U(0,1)
+    
+    Hierarchical: Same formula, but g^l_c(x) is now the factorized version.
+
+This is a drop-in replacement—the masking mechanism itself doesn't change,
+only how g^l_c(x) is computed.
+
+
+================================================================================
+SECTION 3: ARCHITECTURE SPECIFICATION
+================================================================================
+
+3.1 NEW CLASSES TO IMPLEMENT
+----------------------------
+
+CLASS: GroupAssignment
+    """Manages mapping from subcomponents to groups."""
+    
+    Attributes:
+        - num_groups: int (G)
+        - layer_shapes: List[Tuple[int, int]]  # (C^l, ...) for each layer
+        - assignments: Dict[(layer_idx, subcomp_idx) -> group_idx]
+        - group_members: Dict[group_idx -> List[(layer_idx, subcomp_idx)]]
+    
+    Methods:
+        - __init__(num_groups, layer_shapes, init_strategy='random')
+        - get_group(layer_idx, subcomp_idx) -> int
+        - get_group_members(group_idx) -> List[Tuple[int, int]]
+        - reassign_from_coactivation(coactivation_matrix)
+        - to_tensor() -> Tensor  # for batched indexing
+
+
+CLASS: GroupRouter
+    """Computes group-level importance values."""
+    
+    Attributes:
+        - num_groups: int
+        - input_dim: int  # dimension of aggregated representation
+        - hidden_dim: int  # d_router
+        - mlp: nn.Sequential
+    
+    Methods:
+        - __init__(num_groups, input_dim, hidden_dim=64)
+        - forward(aggregated_repr: Tensor) -> Tensor  # shape: (batch, G)
+        - compute_input_repr(inner_activations: Dict[int, Tensor]) -> Tensor
+
+
+CLASS: WithinGroupImportance
+    """Computes importance within a single group."""
+    
+    Attributes:
+        - group_idx: int
+        - num_subcomponents: int  # |K_g|
+        - hidden_dim: int  # d_gate for this group
+        - mlp: nn.Sequential
+    
+    Methods:
+        - __init__(group_idx, num_subcomponents, hidden_dim=16)
+        - forward(group_inner_activations: Tensor) -> Tensor
+
+
+CLASS: HierarchicalImportanceFunction
+    """Combines router and within-group networks."""
+    
+    Attributes:
+        - group_assignment: GroupAssignment
+        - router: GroupRouter
+        - within_group_nets: nn.ModuleDict[str, WithinGroupImportance]
+        - group_threshold: float  # for sparse computation (optional)
+    
+    Methods:
+        - __init__(group_assignment, router_hidden=64, within_hidden=16)
+        - forward(inner_activations: Dict[int, Tensor]) -> Dict[int, Tensor]
+          # Returns importance values organized by layer
+        - get_group_importances(inner_activations) -> Tensor
+        - get_all_importances(inner_activations) -> Tensor  # flattened
+
+
+3.2 MODIFICATIONS TO EXISTING CLASSES
+-------------------------------------
+
+CLASS: SPDModel (or equivalent in codebase)
+    
+    REMOVE:
+        - self.importance_mlps: nn.ModuleList of per-subcomponent MLPs
+    
+    ADD:
+        - self.group_assignment: GroupAssignment
+        - self.hierarchical_importance: HierarchicalImportanceFunction
+    
+    MODIFY:
+        - compute_importance() method to use hierarchical computation
+        - forward() to use factorized importance values
+
+
+CLASS: SPDTrainer (or equivalent)
+    
+    ADD:
+        - self.beta_4: float  # group sparsity coefficient
+        - self.beta_5: float  # group balance coefficient
+        - reassignment_interval: int  # steps between group reassignment
+    
+    MODIFY:
+        - compute_loss() to include L_group-sparsity and L_group-balance
+        - training_step() to periodically trigger group reassignment
+
+3.3 CONFIGURATION DATACLASS
+---------------------------
+
+@dataclass
+class HierarchicalSPDConfig:
+    # Original SPD hyperparameters
+    num_subcomponents_per_layer: int
+    beta_1: float = 1.0  # stochastic recon
+    beta_2: float = 1.0  # stochastic recon layerwise  
+    beta_3: float = 1e-5 # importance minimality
+    p_norm: float = 2.0  # for importance minimality
+    
+    # NEW: Hierarchical hyperparameters
+    num_groups: int = 32
+    router_hidden_dim: int = 64
+    within_group_hidden_dim: int = 16
+    beta_4: float = 1e-4  # group sparsity
+    beta_5: float = 1e-5  # group balance
+    q_norm: float = 1.0   # for group sparsity
+    group_init_strategy: str = 'kmeans'  # 'random', 'kmeans', 'layer_based'
+    reassignment_interval: int = 1000  # training steps
+    min_group_size: int = 4
+    max_group_size: int = None  # defaults to total_subcomponents / num_groups * 3
+
+
+================================================================================
+SECTION 4: IMPLEMENTATION STEPS
+================================================================================
+
+4.1 STEP 1: IMPLEMENT GROUP ASSIGNMENT
+--------------------------------------
+File: spd/hierarchical/group_assignment.py
+
+```python
+import torch
+from typing import Dict, List, Tuple, Optional
+from sklearn.cluster import KMeans
+import numpy as np
+
+class GroupAssignment:
+    def __init__(
+        self,
+        num_groups: int,
+        layer_num_subcomponents: List[int],
+        init_strategy: str = 'random',
+        device: str = 'cpu'
+    ):
+        """
+        Args:
+            num_groups: Number of groups G
+            layer_num_subcomponents: List where element l is C^l
+            init_strategy: 'random', 'layer_based', or 'kmeans'
+        """
+        self.num_groups = num_groups
+        self.layer_num_subcomponents = layer_num_subcomponents
+        self.num_layers = len(layer_num_subcomponents)
+        self.total_subcomponents = sum(layer_num_subcomponents)
+        self.device = device
+        
+        # Create flat index mapping
+        # flat_idx -> (layer, subcomp_within_layer)
+        self._build_index_mappings()
+        
+        # Initialize assignments
+        self.assignments = self._initialize_assignments(init_strategy)
+        
+        # Build reverse mapping: group -> list of flat indices
+        self._build_group_members()
+    
+    def _build_index_mappings(self):
+        """Build bidirectional mappings between flat and (layer, local) indices."""
+        self.flat_to_layer_local = []
+        self.layer_local_to_flat = {}
+        
+        flat_idx = 0
+        for layer_idx, num_sub in enumerate(self.layer_num_subcomponents):
+            for local_idx in range(num_sub):
+                self.flat_to_layer_local.append((layer_idx, local_idx))
+                self.layer_local_to_flat[(layer_idx, local_idx)] = flat_idx
+                flat_idx += 1
+    
+    def _initialize_assignments(self, strategy: str) -> torch.Tensor:
+        """Initialize group assignments. Returns tensor of shape (total_subcomponents,)."""
+        if strategy == 'random':
+            return torch.randint(0, self.num_groups, (self.total_subcomponents,))
+        
+        elif strategy == 'layer_based':
+            # Assign subcomponents from same layer to same group initially
+            assignments = []
+            for layer_idx, num_sub in enumerate(self.layer_num_subcomponents):
+                group_for_layer = layer_idx % self.num_groups
+                assignments.extend([group_for_layer] * num_sub)
+            return torch.tensor(assignments, dtype=torch.long)
+        
+        elif strategy == 'kmeans':
+            # Will be populated after first forward pass with actual activations
+            # For now, use random
+            return torch.randint(0, self.num_groups, (self.total_subcomponents,))
+        
+        else:
+            raise ValueError(f"Unknown init strategy: {strategy}")
+    
+    def _build_group_members(self):
+        """Build dict mapping group_idx -> list of flat indices."""
+        self.group_members = {g: [] for g in range(self.num_groups)}
+        for flat_idx, group_idx in enumerate(self.assignments.tolist()):
+            self.group_members[group_idx].append(flat_idx)
+        
+        # Also store as tensors for efficient indexing
+        self.group_member_tensors = {
+            g: torch.tensor(members, dtype=torch.long, device=self.device)
+            for g, members in self.group_members.items()
+        }
+    
+    def get_group(self, layer_idx: int, local_idx: int) -> int:
+        """Get group index for a subcomponent."""
+        flat_idx = self.layer_local_to_flat[(layer_idx, local_idx)]
+        return self.assignments[flat_idx].item()
+    
+    def get_group_size(self, group_idx: int) -> int:
+        """Get number of subcomponents in a group."""
+        return len(self.group_members[group_idx])
+    
+    def reassign_from_coactivation(
+        self, 
+        coactivation_matrix: torch.Tensor,
+        method: str = 'kmeans'
+    ):
+        """
+        Reassign subcomponents to groups based on co-activation patterns.
+        
+        Args:
+            coactivation_matrix: Shape (total_subcomponents, total_subcomponents)
+                                 Entry [i,j] = how often i and j are both important
+            method: Clustering method ('kmeans', 'spectral')
+        """
+        if method == 'kmeans':
+            # Use co-activation matrix rows as features
+            features = coactivation_matrix.cpu().numpy()
+            kmeans = KMeans(n_clusters=self.num_groups, random_state=42)
+            new_assignments = kmeans.fit_predict(features)
+            self.assignments = torch.tensor(new_assignments, dtype=torch.long)
+        else:
+            raise NotImplementedError(f"Method {method} not implemented")
+        
+        self._build_group_members()
+    
+    def to(self, device: str):
+        """Move tensors to device."""
+        self.device = device
+        self.assignments = self.assignments.to(device)
+        self.group_member_tensors = {
+            g: t.to(device) for g, t in self.group_member_tensors.items()
+        }
+        return self
+```
+
+4.2 STEP 2: IMPLEMENT GROUP ROUTER
+----------------------------------
+File: spd/hierarchical/router.py
+
+```python
+import torch
+import torch.nn as nn
+from typing import Dict, List
+
+class GroupRouter(nn.Module):
+    def __init__(
+        self,
+        num_groups: int,
+        num_layers: int,
+        aggregation: str = 'per_layer_mean',
+        hidden_dim: int = 64,
+        hard_sigmoid_bounds: Tuple[float, float] = (0.0, 1.0)
+    ):
+        """
+        Args:
+            num_groups: Number of groups G
+            num_layers: Number of layers L (for per-layer aggregation)
+            aggregation: 'per_layer_mean', 'global_mean', 'per_layer_max'
+            hidden_dim: Router MLP hidden dimension
+        """
+        super().__init__()
+        self.num_groups = num_groups
+        self.num_layers = num_layers
+        self.aggregation = aggregation
+        
+        # Input dimension depends on aggregation strategy
+        if aggregation in ['per_layer_mean', 'per_layer_max']:
+            input_dim = num_layers
+        elif aggregation == 'global_mean':
+            input_dim = 1
+        else:
+            raise ValueError(f"Unknown aggregation: {aggregation}")
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_groups)
+        )
+        
+        # Hard sigmoid parameters (with leaky version for gradient flow)
+        self.lower_bound, self.upper_bound = hard_sigmoid_bounds
+        self.leak = 0.01
+    
+    def _aggregate_inner_activations(
+        self, 
+        inner_activations: Dict[int, torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Aggregate inner activations into router input.
+        
+        Args:
+            inner_activations: Dict mapping layer_idx -> tensor of shape (batch, C^l)
+        
+        Returns:
+            Tensor of shape (batch, input_dim)
+        """
+        batch_size = next(iter(inner_activations.values())).shape[0]
+        
+        if self.aggregation == 'per_layer_mean':
+            # Mean activation per layer
+            layer_means = []
+            for l in range(self.num_layers):
+                if l in inner_activations:
+                    layer_means.append(inner_activations[l].mean(dim=1, keepdim=True))
+                else:
+                    layer_means.append(torch.zeros(batch_size, 1, 
+                                                   device=next(iter(inner_activations.values())).device))
+            return torch.cat(layer_means, dim=1)  # (batch, L)
+        
+        elif self.aggregation == 'per_layer_max':
+            layer_maxs = []
+            for l in range(self.num_layers):
+                if l in inner_activations:
+                    layer_maxs.append(inner_activations[l].abs().max(dim=1, keepdim=True)[0])
+                else:
+                    layer_maxs.append(torch.zeros(batch_size, 1,
+                                                  device=next(iter(inner_activations.values())).device))
+            return torch.cat(layer_maxs, dim=1)
+        
+        elif self.aggregation == 'global_mean':
+            all_acts = torch.cat([v for v in inner_activations.values()], dim=1)
+            return all_acts.mean(dim=1, keepdim=True)  # (batch, 1)
+    
+    def _leaky_hard_sigmoid(self, x: torch.Tensor, upper_leak: bool = False) -> torch.Tensor:
+        """Hard sigmoid with leaky regions for gradient flow."""
+        if upper_leak:
+            # For importance loss: leak above 1, clamp below 0
+            return torch.where(
+                x <= 0, 
+                torch.zeros_like(x),
+                torch.where(x >= 1, 1 + self.leak * (x - 1), x)
+            )
+        else:
+            # For forward pass: leak below 0, clamp above 1
+            return torch.where(
+                x <= 0,
+                self.leak * x,
+                torch.where(x >= 1, torch.ones_like(x), x)
+            )
+    
+    def forward(
+        self, 
+        inner_activations: Dict[int, torch.Tensor],
+        return_raw: bool = False
+    ) -> torch.Tensor:
+        """
+        Compute group importance values.
+        
+        Args:
+            inner_activations: Dict mapping layer_idx -> (batch, C^l)
+            return_raw: If True, return pre-sigmoid values
+        
+        Returns:
+            Tensor of shape (batch, num_groups)
+        """
+        aggregated = self._aggregate_inner_activations(inner_activations)
+        raw_logits = self.mlp(aggregated)
+        
+        if return_raw:
+            return raw_logits
+        
+        return self._leaky_hard_sigmoid(raw_logits, upper_leak=False)
+```
+
+4.3 STEP 3: IMPLEMENT WITHIN-GROUP IMPORTANCE
+---------------------------------------------
+File: spd/hierarchical/within_group.py
+
+```python
+import torch
+import torch.nn as nn
+
+class WithinGroupImportance(nn.Module):
+    def __init__(
+        self,
+        group_size: int,
+        hidden_dim: int = 16
+    ):
+        """
+        Args:
+            group_size: Number of subcomponents in this group |K_g|
+            hidden_dim: MLP hidden dimension
+        """
+        super().__init__()
+        self.group_size = group_size
+        
+        if group_size == 0:
+            self.mlp = None
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(group_size, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, group_size)
+            )
+        
+        self.leak = 0.01
+    
+    def _leaky_hard_sigmoid(self, x: torch.Tensor, upper_leak: bool = False) -> torch.Tensor:
+        if upper_leak:
+            return torch.where(
+                x <= 0, 
+                torch.zeros_like(x),
+                torch.where(x >= 1, 1 + self.leak * (x - 1), x)
+            )
+        else:
+            return torch.where(
+                x <= 0,
+                self.leak * x,
+                torch.where(x >= 1, torch.ones_like(x), x)
+            )
+    
+    def forward(
+        self, 
+        group_inner_activations: torch.Tensor,
+        return_raw: bool = False
+    ) -> torch.Tensor:
+        """
+        Compute within-group importance.
+        
+        Args:
+            group_inner_activations: Shape (batch, group_size)
+            return_raw: If True, return pre-sigmoid values
+        
+        Returns:
+            Tensor of shape (batch, group_size)
+        """
+        if self.mlp is None:
+            return torch.zeros(group_inner_activations.shape[0], 0,
+                              device=group_inner_activations.device)
+        
+        raw_logits = self.mlp(group_inner_activations)
+        
+        if return_raw:
+            return raw_logits
+        
+        return self._leaky_hard_sigmoid(raw_logits, upper_leak=False)
+```
+
+4.4 STEP 4: IMPLEMENT COMBINED HIERARCHICAL IMPORTANCE
+------------------------------------------------------
+File: spd/hierarchical/importance.py
+
+```python
+import torch
+import torch.nn as nn
+from typing import Dict, Tuple
+
+class HierarchicalImportanceFunction(nn.Module):
+    def __init__(
+        self,
+        group_assignment: GroupAssignment,
+        router_hidden_dim: int = 64,
+        within_group_hidden_dim: int = 16,
+        router_aggregation: str = 'per_layer_mean'
+    ):
+        super().__init__()
+        self.group_assignment = group_assignment
+        
+        # Router network
+        self.router = GroupRouter(
+            num_groups=group_assignment.num_groups,
+            num_layers=group_assignment.num_layers,
+            aggregation=router_aggregation,
+            hidden_dim=router_hidden_dim
+        )
+        
+        # Within-group networks (one per group)
+        self.within_group_nets = nn.ModuleDict()
+        for g in range(group_assignment.num_groups):
+            group_size = group_assignment.get_group_size(g)
+            self.within_group_nets[str(g)] = WithinGroupImportance(
+                group_size=group_size,
+                hidden_dim=within_group_hidden_dim
+            )
+    
+    def _gather_group_activations(
+        self,
+        inner_activations: Dict[int, torch.Tensor],
+        group_idx: int
+    ) -> torch.Tensor:
+        """
+        Gather inner activations for all subcomponents in a group.
+        
+        Returns:
+            Tensor of shape (batch, group_size)
+        """
+        group_flat_indices = self.group_assignment.group_members[group_idx]
+        if len(group_flat_indices) == 0:
+            batch_size = next(iter(inner_activations.values())).shape[0]
+            device = next(iter(inner_activations.values())).device
+            return torch.zeros(batch_size, 0, device=device)
+        
+        activations = []
+        for flat_idx in group_flat_indices:
+            layer_idx, local_idx = self.group_assignment.flat_to_layer_local[flat_idx]
+            activations.append(inner_activations[layer_idx][:, local_idx:local_idx+1])
+        
+        return torch.cat(activations, dim=1)  # (batch, group_size)
+    
+    def forward(
+        self,
+        inner_activations: Dict[int, torch.Tensor]
+    ) -> Tuple[Dict[int, torch.Tensor], torch.Tensor]:
+        """
+        Compute factorized importance values for all subcomponents.
+        
+        Args:
+            inner_activations: Dict mapping layer_idx -> (batch, C^l)
+        
+        Returns:
+            importance_by_layer: Dict mapping layer_idx -> (batch, C^l)
+            group_importances: (batch, num_groups) for sparsity loss
+        """
+        batch_size = next(iter(inner_activations.values())).shape[0]
+        device = next(iter(inner_activations.values())).device
+        
+        # Step 1: Compute group importances
+        group_importances = self.router(inner_activations)  # (batch, G)
+        
+        # Step 2: Compute within-group importances and combine
+        # Initialize output tensors
+        importance_by_layer = {
+            l: torch.zeros(batch_size, self.group_assignment.layer_num_subcomponents[l], 
+                          device=device)
+            for l in range(self.group_assignment.num_layers)
+        }
+        
+        for g in range(self.group_assignment.num_groups):
+            group_flat_indices = self.group_assignment.group_members[g]
+            if len(group_flat_indices) == 0:
+                continue
+            
+            # Gather activations for this group
+            group_acts = self._gather_group_activations(inner_activations, g)
+            
+            # Compute within-group importance
+            within_importance = self.within_group_nets[str(g)](group_acts)  # (batch, |K_g|)
+            
+            # Combine: g_combined = g_group * g_within
+            g_group = group_importances[:, g:g+1]  # (batch, 1)
+            combined_importance = g_group * within_importance  # (batch, |K_g|)
+            
+            # Scatter back to layer-organized structure
+            for local_g_idx, flat_idx in enumerate(group_flat_indices):
+                layer_idx, layer_local_idx = self.group_assignment.flat_to_layer_local[flat_idx]
+                importance_by_layer[layer_idx][:, layer_local_idx] = combined_importance[:, local_g_idx]
+        
+        return importance_by_layer, group_importances
+    
+    def get_importance_for_loss(
+        self,
+        inner_activations: Dict[int, torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get flattened importance values with upper-leaky sigmoid for loss computation.
+        
+        Returns:
+            all_importances: (batch, total_subcomponents) 
+            group_importances: (batch, num_groups)
+        """
+        # For the loss, we need upper-leaky versions
+        group_importances_raw = self.router(inner_activations, return_raw=True)
+        group_importances = self.router._leaky_hard_sigmoid(group_importances_raw, upper_leak=True)
+        
+        batch_size = group_importances.shape[0]
+        device = group_importances.device
+        all_importances = torch.zeros(batch_size, self.group_assignment.total_subcomponents,
+                                      device=device)
+        
+        for g in range(self.group_assignment.num_groups):
+            group_flat_indices = self.group_assignment.group_members[g]
+            if len(group_flat_indices) == 0:
+                continue
+            
+            group_acts = self._gather_group_activations(inner_activations, g)
+            within_raw = self.within_group_nets[str(g)](group_acts, return_raw=True)
+            within_importance = self.within_group_nets[str(g)]._leaky_hard_sigmoid(
+                within_raw, upper_leak=True
+            )
+            
+            g_group = group_importances[:, g:g+1]
+            combined = g_group * within_importance
+            
+            indices = self.group_assignment.group_member_tensors[g]
+            all_importances[:, indices] = combined
+        
+        return all_importances, group_importances
+```
+
+4.5 STEP 5: IMPLEMENT GROUP REASSIGNMENT LOGIC
+----------------------------------------------
+File: spd/hierarchical/reassignment.py
+
+```python
+import torch
+from typing import Optional
+
+def compute_coactivation_matrix(
+    importance_history: torch.Tensor,
+    threshold: float = 0.5
+) -> torch.Tensor:
+    """
+    Compute co-activation matrix from importance value history.
+    
+    Args:
+        importance_history: (num_samples, total_subcomponents)
+        threshold: Importance threshold for "active"
+    
+    Returns:
+        Symmetric matrix of shape (total_subcomponents, total_subcomponents)
+    """
+    # Binarize based on threshold
+    active = (importance_history > threshold).float()  # (N, C)
+    
+    # Co-activation: how often are both i and j active?
+    coactivation = active.T @ active  # (C, C)
+    
+    # Normalize by number of samples
+    coactivation = coactivation / importance_history.shape[0]
+    
+    return coactivation
+
+
+class ImportanceHistoryTracker:
+    """Tracks importance values over training for group reassignment."""
+    
+    def __init__(
+        self,
+        total_subcomponents: int,
+        max_samples: int = 10000,
+        device: str = 'cpu'
+    ):
+        self.total_subcomponents = total_subcomponents
+        self.max_samples = max_samples
+        self.device = device
+        
+        self.history = torch.zeros(max_samples, total_subcomponents, device=device)
+        self.current_idx = 0
+        self.num_stored = 0
+    
+    def add(self, importance_values: torch.Tensor):
+        """
+        Add a batch of importance values to history.
+        
+        Args:
+            importance_values: (batch, total_subcomponents)
+        """
+        batch_size = importance_values.shape[0]
+        
+        # Circular buffer
+        for i in range(batch_size):
+            self.history[self.current_idx] = importance_values[i].detach()
+            self.current_idx = (self.current_idx + 1) % self.max_samples
+            self.num_stored = min(self.num_stored + 1, self.max_samples)
+    
+    def get_coactivation_matrix(self, threshold: float = 0.5) -> torch.Tensor:
+        """Compute co-activation matrix from stored history."""
+        if self.num_stored == 0:
+            return torch.eye(self.total_subcomponents, device=self.device)
+        
+        valid_history = self.history[:self.num_stored]
+        return compute_coactivation_matrix(valid_history, threshold)
+    
+    def reset(self):
+        """Clear history after reassignment."""
+        self.history.zero_()
+        self.current_idx = 0
+        self.num_stored = 0
+```
+
+4.6 STEP 6: MODIFY SPD TRAINING LOOP
+------------------------------------
+File: spd/hierarchical/trainer.py (or modify existing trainer)
+
+```python
+# Key modifications to the training loop:
+
+class HierarchicalSPDTrainer:
+    def __init__(
+        self,
+        model,  # The model being decomposed
+        config: HierarchicalSPDConfig,
+        # ... other args
+    ):
+        self.config = config
+        
+        # Initialize group assignment
+        layer_num_subcomponents = [config.num_subcomponents_per_layer] * model.num_layers
+        self.group_assignment = GroupAssignment(
+            num_groups=config.num_groups,
+            layer_num_subcomponents=layer_num_subcomponents,
+            init_strategy=config.group_init_strategy
+        )
+        
+        # Initialize hierarchical importance function
+        self.hierarchical_importance = HierarchicalImportanceFunction(
+            group_assignment=self.group_assignment,
+            router_hidden_dim=config.router_hidden_dim,
+            within_group_hidden_dim=config.within_group_hidden_dim
+        )
+        
+        # Initialize subcomponents U, V as in original SPD
+        # ... (same as original)
+        
+        # Tracker for group reassignment
+        self.importance_tracker = ImportanceHistoryTracker(
+            total_subcomponents=self.group_assignment.total_subcomponents
+        )
+        
+        self.step_count = 0
+    
+    def compute_inner_activations(self, batch_activations: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
+        """Compute h^l_c = V^l_c @ a^l for all subcomponents."""
+        inner_acts = {}
+        for layer_idx, acts in batch_activations.items():
+            V = self.V[layer_idx]  # (C, d_in)
+            inner_acts[layer_idx] = acts @ V.T  # (batch, C)
+        return inner_acts
+    
+    def compute_losses(
+        self,
+        batch,
+        importance_by_layer: Dict[int, torch.Tensor],
+        group_importances: torch.Tensor,
+        all_importances: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Compute all loss terms."""
+        losses = {}
+        
+        # Original SPD losses (faithfulness, stochastic recon, etc.)
+        losses['faithfulness'] = self._compute_faithfulness_loss()
+        losses['stochastic_recon'] = self._compute_stochastic_recon_loss(
+            batch, importance_by_layer
+        )
+        losses['stochastic_recon_layerwise'] = self._compute_stochastic_recon_layerwise_loss(
+            batch, importance_by_layer
+        )
+        
+        # Modified importance minimality (now using factorized values)
+        losses['importance_minimality'] = (all_importances.abs() ** self.config.p_norm).sum(dim=1).mean()
+        
+        # NEW: Group sparsity loss
+        losses['group_sparsity'] = (group_importances.abs() ** self.config.q_norm).sum(dim=1).mean()
+        
+        # NEW: Group balance loss (optional, encourages even group sizes)
+        group_sizes = torch.tensor([
+            self.group_assignment.get_group_size(g) 
+            for g in range(self.config.num_groups)
+        ], dtype=torch.float)
+        mean_size = group_sizes.mean()
+        losses['group_balance'] = ((group_sizes - mean_size) ** 2).mean() / (mean_size ** 2 + 1e-8)
+        
+        # Total loss
+        losses['total'] = (
+            losses['faithfulness']
+            + self.config.beta_1 * losses['stochastic_recon']
+            + self.config.beta_2 * losses['stochastic_recon_layerwise']
+            + self.config.beta_3 * losses['importance_minimality']
+            + self.config.beta_4 * losses['group_sparsity']
+            + self.config.beta_5 * losses['group_balance']
+        )
+        
+        return losses
+    
+    def training_step(self, batch):
+        """Single training step."""
+        # Get target model activations
+        with torch.no_grad():
+            target_output, layer_activations = self.target_model(batch, return_activations=True)
+        
+        # Compute inner activations
+        inner_acts = self.compute_inner_activations(layer_activations)
+        
+        # Get importance values
+        importance_by_layer, group_importances = self.hierarchical_importance(inner_acts)
+        all_importances, group_importances_for_loss = self.hierarchical_importance.get_importance_for_loss(inner_acts)
+        
+        # Compute losses
+        losses = self.compute_losses(
+            batch, importance_by_layer, group_importances_for_loss, all_importances
+        )
+        
+        # Backprop
+        losses['total'].backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        
+        # Track importance for reassignment
+        self.importance_tracker.add(all_importances)
+        
+        # Periodic group reassignment
+        self.step_count += 1
+        if self.step_count % self.config.reassignment_interval == 0:
+            self._reassign_groups()
+        
+        return losses
+    
+    def _reassign_groups(self):
+        """Reassign subcomponents to groups based on co-activation."""
+        print(f"Step {self.step_count}: Reassigning groups...")
+        
+        coactivation = self.importance_tracker.get_coactivation_matrix()
+        self.group_assignment.reassign_from_coactivation(coactivation)
+        
+        # Rebuild within-group networks for new group sizes
+        self.hierarchical_importance = HierarchicalImportanceFunction(
+            group_assignment=self.group_assignment,
+            router_hidden_dim=self.config.router_hidden_dim,
+            within_group_hidden_dim=self.config.within_group_hidden_dim
+        ).to(self.device)
+        
+        # Reset tracker
+        self.importance_tracker.reset()
+        
+        # Update optimizer to include new parameters
+        self._rebuild_optimizer()
+```
+
+4.7 STEP 7: ADD TESTS
+---------------------
+File: tests/test_hierarchical.py
+
+```python
+import pytest
+import torch
+from spd.hierarchical import (
+    GroupAssignment,
+    GroupRouter, 
+    WithinGroupImportance,
+    HierarchicalImportanceFunction
+)
+
+class TestGroupAssignment:
+    def test_initialization(self):
+        ga = GroupAssignment(
+            num_groups=4,
+            layer_num_subcomponents=[10, 20, 10],
+            init_strategy='random'
+        )
+        assert ga.total_subcomponents == 40
+        assert ga.num_groups == 4
+        assert len(ga.assignments) == 40
+        
+    def test_layer_based_init(self):
+        ga = GroupAssignment(
+            num_groups=3,
+            layer_num_subcomponents=[5, 5, 5],
+            init_strategy='layer_based'
+        )
+        # Layer 0 -> group 0, layer 1 -> group 1, layer 2 -> group 2
+        assert ga.get_group(0, 0) == 0
+        assert ga.get_group(1, 0) == 1
+        assert ga.get_group(2, 0) == 2
+    
+    def test_bidirectional_indexing(self):
+        ga = GroupAssignment(
+            num_groups=2,
+            layer_num_subcomponents=[3, 4],
+            init_strategy='random'
+        )
+        for flat_idx in range(7):
+            layer, local = ga.flat_to_layer_local[flat_idx]
+            assert ga.layer_local_to_flat[(layer, local)] == flat_idx
+
+
+class TestGroupRouter:
+    def test_forward_shape(self):
+        router = GroupRouter(
+            num_groups=8,
+            num_layers=4,
+            aggregation='per_layer_mean',
+            hidden_dim=32
+        )
+        inner_acts = {
+            0: torch.randn(16, 100),
+            1: torch.randn(16, 100),
+            2: torch.randn(16, 100),
+            3: torch.randn(16, 100),
+        }
+        output = router(inner_acts)
+        assert output.shape == (16, 8)
+        assert (output >= -0.1).all() and (output <= 1.1).all()  # leaky bounds
+
+
+class TestHierarchicalImportance:
+    def test_end_to_end(self):
+        ga = GroupAssignment(
+            num_groups=4,
+            layer_num_subcomponents=[20, 20],
+            init_strategy='random'
+        )
+        hif = HierarchicalImportanceFunction(
+            group_assignment=ga,
+            router_hidden_dim=32,
+            within_group_hidden_dim=16
+        )
+        
+        inner_acts = {
+            0: torch.randn(8, 20),
+            1: torch.randn(8, 20),
+        }
+        
+        importance_by_layer, group_importance = hif(inner_acts)
+        
+        assert importance_by_layer[0].shape == (8, 20)
+        assert importance_by_layer[1].shape == (8, 20)
+        assert group_importance.shape == (8, 4)
+    
+    def test_factorization_constraint(self):
+        """Test that combined importance <= min(group, within)."""
+        ga = GroupAssignment(
+            num_groups=2,
+            layer_num_subcomponents=[10],
+            init_strategy='layer_based'
+        )
+        hif = HierarchicalImportanceFunction(ga)
+        
+        inner_acts = {0: torch.randn(4, 10)}
+        importance_by_layer, group_importance = hif(inner_acts)
+        
+        # Combined importance should be product of group and within
+        # Both are in [0,1], so combined should be in [0,1] as well
+        assert (importance_by_layer[0] >= -0.05).all()
+        assert (importance_by_layer[0] <= 1.05).all()
+```
+
+
+================================================================================
+SECTION 5: INTEGRATION CHECKLIST
+================================================================================
+
+5.1 FILES TO CREATE
+-------------------
+[ ] spd/hierarchical/__init__.py
+[ ] spd/hierarchical/group_assignment.py
+[ ] spd/hierarchical/router.py
+[ ] spd/hierarchical/within_group.py
+[ ] spd/hierarchical/importance.py
+[ ] spd/hierarchical/reassignment.py
+[ ] spd/hierarchical/config.py
+[ ] tests/test_hierarchical.py
+
+5.2 FILES TO MODIFY
+-------------------
+[ ] spd/trainer.py (or equivalent) - Add HierarchicalSPDTrainer option
+[ ] spd/config.py - Add HierarchicalSPDConfig
+[ ] spd/models.py (if exists) - Integrate hierarchical importance
+
+5.3 TESTING CHECKLIST
+---------------------
+[ ] Unit tests for GroupAssignment
+[ ] Unit tests for GroupRouter
+[ ] Unit tests for WithinGroupImportance
+[ ] Unit tests for HierarchicalImportanceFunction
+[ ] Integration test: full training loop on TMS5-2
+[ ] Integration test: full training loop on TMS40-10
+[ ] Comparison test: H-SPD vs original SPD on same model
+[ ] Memory usage comparison
+[ ] Training time comparison
+
+5.4 VALIDATION EXPERIMENTS
+--------------------------
+After implementation, validate on existing toy models:
+
+(a) TMS5-2: 
+    - Should find 5 groups (one per feature) + potentially 1 unused
+    - MMCS should remain ~1.0
+    - Training time should be similar or faster
+
+(b) TMS5-2+ID:
+    - Should find 5 feature groups + 1 identity group
+    - The identity group should contain 2 subcomponents
+    - Validates cross-layer grouping
+
+(c) Compressed Computation (1-layer):
+    - Should find ~100 groups for Win (one per feature)
+    - Should find ~1 group for Wout (the rank-50 identity)
+    - Key validation: Wout subcomponents should cluster together
+
+(d) Distributed Representations (2-layer, 3-layer):
+    - Groups should span multiple layers
+    - The Wout component spanning layers should emerge as one group
+
+
+================================================================================
+SECTION 6: HYPERPARAMETER GUIDANCE
+================================================================================
+
+6.1 NEW HYPERPARAMETERS
+-----------------------
+
+num_groups (G):
+    - Start with: 2× expected number of mechanisms
+    - For TMS models: ~2× number of features
+    - For compressed computation: ~number of features + 10
+    - Rule of thumb: sqrt(total_subcomponents) to total_subcomponents/10
+
+router_hidden_dim:
+    - Default: 64
+    - Increase for larger models
+    - Memory cost is O(L × router_hidden_dim + router_hidden_dim × G)
+
+within_group_hidden_dim:
+    - Default: 16
+    - Can be smaller than original SPD's d_gate since groups are smaller
+    - Memory scales with G × within_hidden_dim × avg_group_size
+
+beta_4 (group sparsity):
+    - Start with: 1e-4 (same order as beta_3)
+    - Increase if too many groups active
+    - Decrease if groups aren't forming properly
+
+beta_5 (group balance):
+    - Start with: 1e-5 (small regularization)
+    - Increase if seeing degenerate groups (all empty or one huge)
+    - Can often be set to 0 initially
+
+q_norm (group sparsity norm):
+    - Default: 1.0 (L1 sparsity)
+    - Use 0.5-1.0 for aggressive sparsity
+    - Use 2.0 for gentler regularization
+
+reassignment_interval:
+    - Default: 1000 steps
+    - Decrease for faster adaptation (may be unstable)
+    - Increase for more stable training
+
+6.2 SUGGESTED STARTING CONFIGS
+------------------------------
+
+For TMS5-2:
+    num_groups: 8
+    router_hidden_dim: 32
+    within_group_hidden_dim: 8
+    beta_4: 1e-4
+    beta_5: 0
+    reassignment_interval: 500
+
+For TMS40-10:
+    num_groups: 50
+    router_hidden_dim: 64
+    within_group_hidden_dim: 16
+    beta_4: 1e-5
+    beta_5: 1e-6
+    reassignment_interval: 1000
+
+For Compressed Computation:
+    num_groups: 120
+    router_hidden_dim: 128
+    within_group_hidden_dim: 32
+    beta_4: 1e-5
+    beta_5: 1e-5
+    reassignment_interval: 2000
+
+
+================================================================================
+SECTION 7: POTENTIAL ISSUES AND MITIGATIONS
+================================================================================
+
+7.1 EMPTY GROUPS
+----------------
+Problem: Some groups may end up with zero subcomponents after reassignment.
+Mitigation: 
+    - Skip empty groups in forward pass (already handled in code)
+    - Add minimum group size constraint in reassignment
+    - Reinitialize empty groups randomly from largest groups
+
+7.2 REASSIGNMENT INSTABILITY
+----------------------------
+Problem: Changing group assignments changes network architecture mid-training.
+Mitigation:
+    - Only reassign after loss has stabilized
+    - Use soft assignment (future work) instead of hard reassignment
+    - Carry over within-group network weights when possible
+
+7.3 GRADIENT FLOW THROUGH ROUTING
+---------------------------------
+Problem: Hard group selection blocks gradients.
+Mitigation:
+    - Using continuous importance values (already implemented)
+    - Leaky hard sigmoid ensures gradient flow
+    - Future: Gumbel-softmax for discrete sampling with gradients
+
+7.4 SCALABILITY OF COACTIVATION MATRIX
+--------------------------------------
+Problem: O(C²) memory for coactivation matrix.
+Mitigation:
+    - Compute in chunks/streaming fashion
+    - Use random projections to reduce dimensionality
+    - Only track top-k most important subcomponents per sample
+
+
+================================================================================
+SECTION 8: FUTURE EXTENSIONS
+================================================================================
+
+8.1 SOFT GROUP ASSIGNMENT
+-------------------------
+Replace hard assignment with probabilistic:
+    P(subcomponent c in group g) = softmax(W_assign @ features_c)
+This allows end-to-end learning of group structure.
+
+8.2 HIERARCHICAL GROUPS (GROUPS OF GROUPS)
+------------------------------------------
+For very large models, add another level:
+    Super-groups -> Groups -> Subcomponents
+Router first selects super-groups, then groups within.
+
+8.3 CROSS-LAYER SUBCOMPONENT PARAMETERIZATION
+---------------------------------------------
+Currently, subcomponents are per-layer. Could extend to:
+    Single subcomponent = {(U^l, V^l) for l in involved_layers}
+This would make cross-layer mechanisms first-class objects.
+
+8.4 LEARNED REASSIGNMENT
+------------------------
+Replace k-means with learned clustering:
+    - Train a clustering network end-to-end
+    - Use straight-through estimator for discrete assignments
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================

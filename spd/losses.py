@@ -9,6 +9,7 @@ from spd.configs import (
     CIMaskedReconLossConfig,
     CIMaskedReconSubsetLossConfig,
     FaithfulnessLossConfig,
+    GroupSparsityLossConfig,
     ImportanceMinimalityLossConfig,
     LossMetricConfigType,
     PGDReconLayerwiseLossConfig,
@@ -26,6 +27,7 @@ from spd.metrics import (
     ci_masked_recon_loss,
     ci_masked_recon_subset_loss,
     faithfulness_loss,
+    group_sparsity_loss,
     importance_minimality_loss,
     pgd_recon_layerwise_loss,
     pgd_recon_loss,
@@ -74,6 +76,15 @@ def compute_total_loss(
                     p_anneal_start_frac=cfg.p_anneal_start_frac,
                     p_anneal_final_p=cfg.p_anneal_final_p,
                     p_anneal_end_frac=cfg.p_anneal_end_frac,
+                )
+            case GroupSparsityLossConfig():
+                if ci.group_importances is None:
+                    raise ValueError(
+                        "GroupSparsityLoss requires ci_fn_type='hierarchical' to be set"
+                    )
+                loss = group_sparsity_loss(
+                    group_importances=ci.group_importances,
+                    pnorm=cfg.pnorm,
                 )
             case UnmaskedReconLossConfig():
                 loss = unmasked_recon_loss(
