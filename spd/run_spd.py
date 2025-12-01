@@ -100,14 +100,25 @@ def get_unique_metric_configs(
     loss_configs: list[LossMetricConfigType], eval_configs: list[MetricConfigType]
 ) -> list[MetricConfigType]:
     """If a metric appears in both loss and eval configs, only include the eval version."""
+    # These loss configs are training-only and shouldn't be evaluated as metrics
+    training_only_losses = {
+        "FaithfulnessLossConfig",
+        "ImportanceMinimalityLossConfig",
+        "GroupSparsityLossConfig",
+    }
+
     eval_config_names = [type(cfg).__name__ for cfg in eval_configs]
     eval_metric_configs = eval_configs[:]
     for cfg in loss_configs:
-        if type(cfg).__name__ not in eval_config_names:
+        cfg_name = type(cfg).__name__
+        if cfg_name in training_only_losses:
+            # Skip training-only losses - they can't be evaluated
+            continue
+        if cfg_name not in eval_config_names:
             eval_metric_configs.append(cfg)
         else:
             logger.warning(
-                f"{type(cfg).__name__} is in both loss and eval configs, only including eval config"
+                f"{cfg_name} is in both loss and eval configs, only including eval config"
             )
     return eval_metric_configs
 
@@ -202,7 +213,14 @@ def optimize(
     ci_fn_params: list[torch.nn.Parameter] = []
     for name in component_model.target_module_paths:
         component_params.extend(component_model.components[name].parameters())
-        ci_fn_params.extend(component_model.ci_fns[name].parameters())
+        # In hierarchical mode, ci_fns is empty - use hierarchical_ci_fn instead
+        if component_model.ci_fn_type == "hierarchical":
+            # Only add hierarchical CI params once (not per module)
+            if name == component_model.target_module_paths[0]:
+                assert component_model.hierarchical_ci_fn is not None
+                ci_fn_params.extend(component_model.hierarchical_ci_fn.parameters())
+        else:
+            ci_fn_params.extend(component_model.ci_fns[name].parameters())
 
     assert len(component_params) > 0, "No parameters found in components to optimize"
 
@@ -217,6 +235,9 @@ def optimize(
 
     eval_metric_configs = get_unique_metric_configs(
         loss_configs=config.loss_metric_configs, eval_configs=config.eval_metric_configs
+    )
+    logger.info(
+        f"Eval metrics after filtering: {[type(cfg).__name__ for cfg in eval_metric_configs]}"
     )
 
     multibatch_pgd_eval_configs: list[

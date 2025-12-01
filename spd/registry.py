@@ -46,6 +46,13 @@ EXPERIMENT_REGISTRY: dict[str, ExperimentConfig] = {
         expected_runtime=4,
         canonical_run="wandb:goodfire/spd/runs/dwalcejo",
     ),
+    "tms_5-2_hierarchical_test": ExperimentConfig(
+        task_name="tms",
+        decomp_script=Path("spd/experiments/tms/tms_decomposition.py"),
+        config_path=Path("spd/experiments/tms/tms_5-2_hierarchical_test_config.yaml"),
+        expected_runtime=2,  # 1000 steps, quicker than standard
+        canonical_run=None,
+    ),
     "tms_40-10": ExperimentConfig(
         task_name="tms",
         decomp_script=Path("spd/experiments/tms/tms_decomposition.py"),
