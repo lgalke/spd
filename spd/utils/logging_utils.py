@@ -59,18 +59,35 @@ def get_grad_norms_dict(
 
     ci_fn_grad_norm_sq_sum: Float[Tensor, ""] = torch.zeros((), device=device)
     ci_fn_n_params = 0
-    for target_module_path, ci_fn in component_model.ci_fns.items():
-        for local_param_name, local_param in ci_fn.named_parameters():
+
+    # Handle hierarchical mode where ci_fns is empty
+    if component_model.ci_fn_type == "hierarchical" and component_model.hierarchical_ci_fn is not None:
+        for local_param_name, local_param in component_model.hierarchical_ci_fn.named_parameters():
             ci_fn_grad = runtime_cast(Tensor, local_param.grad)
             ci_fn_grad_sum_sq = ci_fn_grad.pow(2).sum()
-            key = f"ci_fns/{target_module_path}.{local_param_name}"
+            key = f"ci_fns/hierarchical.{local_param_name}"
             assert key not in out, f"Key {key} already exists in grad norms log"
             out[key] = ci_fn_grad_sum_sq.sqrt().item()
             ci_fn_grad_norm_sq_sum += ci_fn_grad_sum_sq
             ci_fn_n_params += ci_fn_grad.numel()
+    else:
+        # Standard mode with per-module CI functions
+        for target_module_path, ci_fn in component_model.ci_fns.items():
+            for local_param_name, local_param in ci_fn.named_parameters():
+                ci_fn_grad = runtime_cast(Tensor, local_param.grad)
+                ci_fn_grad_sum_sq = ci_fn_grad.pow(2).sum()
+                key = f"ci_fns/{target_module_path}.{local_param_name}"
+                assert key not in out, f"Key {key} already exists in grad norms log"
+                out[key] = ci_fn_grad_sum_sq.sqrt().item()
+                ci_fn_grad_norm_sq_sum += ci_fn_grad_sum_sq
+                ci_fn_n_params += ci_fn_grad.numel()
 
     out["summary/components"] = (comp_grad_norm_sq_sum / comp_n_params).sqrt().item()
-    out["summary/ci_fns"] = (ci_fn_grad_norm_sq_sum / ci_fn_n_params).sqrt().item()
+    # Only compute ci_fns summary if there are parameters (avoid 0/0 = NaN)
+    if ci_fn_n_params > 0:
+        out["summary/ci_fns"] = (ci_fn_grad_norm_sq_sum / ci_fn_n_params).sqrt().item()
+    else:
+        out["summary/ci_fns"] = 0.0
 
     total_grad_norm_sq_sum = comp_grad_norm_sq_sum + ci_fn_grad_norm_sq_sum
     total_n_params = comp_n_params + ci_fn_n_params
