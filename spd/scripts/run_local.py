@@ -1,5 +1,6 @@
 """Local SPD experiment runner"""
 
+import os
 import subprocess
 import sys
 
@@ -65,9 +66,12 @@ def main(
         ]
 
     if cpu:
+        # Inherit parent environment and override CUDA_VISIBLE_DEVICES
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = ""
         env_prefix = "CUDA_VISIBLE_DEVICES="
         logger.info(f"Running: {env_prefix} {' '.join(cmd)}")
-        subprocess.run(cmd, check=True, env={"CUDA_VISIBLE_DEVICES": ""})
+        subprocess.run(cmd, check=True, env=env)
     else:
         logger.info(f"Running: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
