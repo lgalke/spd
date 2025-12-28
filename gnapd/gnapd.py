@@ -48,10 +48,10 @@ def main():
     model = TensorGNAN(
         in_channels=num_params,
         out_channels=1,
-        n_layers=1,
-        hidden_channels=None,
+        n_layers=2,
+        hidden_channels=128,
         bias=True,
-        dropout=0.0,
+        dropout=0.2,
         device='cpu',
         normalize_rho=False,
         rho_per_feature=False
