@@ -100,6 +100,41 @@ def calc_schatten_loss(
     return total_loss
 
 
+def calc_orthogonality_loss(
+    components: dict[str, LinearComponent | EmbeddingComponent],
+    device: str,
+) -> Float[Tensor, ""]:
+    """Calculate orthogonality loss encouraging component weight matrices to be orthogonal.
+
+    For each component layer, this computes the Gram matrix of reconstructed weights
+    and penalizes non-diagonal entries (i.e., inner products between different components).
+
+    The reconstructed weight for component c is W_c = outer(A[:, c], B[c, :]).
+    The Frobenius inner product <W_i, W_j>_F = (A^T @ A)[i,j] * (B @ B^T)[i,j].
+    This loss penalizes the sum of squared off-diagonal entries of this Gram matrix.
+
+    Args:
+        components: Dictionary of components for each layer.
+        device: The device to compute the loss on.
+
+    Returns:
+        The orthogonality loss as a scalar tensor.
+    """
+    total_loss = torch.tensor(0.0, device=device)
+    for component in components.values():
+        # G_A[i,j] = A[:, i]^T @ A[:, j]
+        G_A = component.A.T @ component.A  # (C, C)
+        # G_B[i,j] = B[i, :] @ B[j, :]^T
+        G_B = component.B @ component.B.T  # (C, C)
+        # G[i,j] = <W_i, W_j>_F where W_c is reconstructed weight of component c
+        G = G_A * G_B
+        # Penalize off-diagonal entries (squared Frobenius norm of off-diagonal)
+        C = component.A.shape[1]
+        mask = ~torch.eye(C, dtype=torch.bool, device=device)
+        total_loss += G[mask].pow(2).sum()
+    return total_loss
+
+
 def calc_importance_minimality_loss(
     ci_upper_leaky: dict[str, Float[Tensor, "... C"]], pnorm: float
 ) -> Float[Tensor, ""]:
@@ -397,6 +432,15 @@ def calculate_losses(
         )
         total_loss += config.schatten_coeff * schatten_loss
         loss_terms["loss/schatten"] = schatten_loss.item()
+
+    # Orthogonality loss
+    if config.orthogonality_coeff is not None:
+        orthogonality_loss = calc_orthogonality_loss(
+            components=components,
+            device=device,
+        )
+        total_loss += config.orthogonality_coeff * orthogonality_loss
+        loss_terms["loss/orthogonality"] = orthogonality_loss.item()
 
     # Output reconstruction loss
     if config.out_recon_coeff is not None:

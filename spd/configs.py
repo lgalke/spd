@@ -148,6 +148,10 @@ class Config(BaseModel):
         default=None,
         description="Coefficient for Schatten-norm regularisation (LM only)",
     )
+    orthogonality_coeff: NonNegativeFloat | None = Field(
+        default=None,
+        description="Coefficient for orthogonality loss encouraging component weights to be orthogonal",
+    )
     out_recon_coeff: NonNegativeFloat | None = Field(
         default=None,
         description="Coefficient for output recon loss",
